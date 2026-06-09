@@ -1,25 +1,55 @@
 {
   "name": "echo-wechat",
   "version": "0.1.0",
-  "description": "WeChat channel for EchoAI — connects a personal WeChat account to an EchoAI agent.",
+  "description": "WeChat channel for EchoAI — talk to your EchoAI agent from WeChat (text + media).",
   "type": "module",
-  "comment_ilink": "iLink protocol fields read by src/protocol/api/api.ts. ilink_appid identifies this as the WeChat plugin's own package.json; ilink_client_version feeds the iLink-App-ClientVersion header. Keep aligned with the vendored protocol layer (upstream @tencent-weixin/openclaw-weixin 2.4.4).",
   "ilink_appid": "bot",
   "ilink_client_version": "2.4.4",
+  "_comment_ilink": "ilink_appid + ilink_client_version are read by src/protocol/api/api.ts to build the iLink protocol headers; keep aligned with the vendored upstream @tencent-weixin/openclaw-weixin.",
   "bin": {
     "echo-wechat": "dist/cli.js"
   },
   "main": "dist/cli.js",
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "!dist/**/*.test.js",
+    "!dist/**/*.test.js.map",
+    "README.md",
+    "NOTICE.md"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "tsc --watch",
     "login": "node dist/cli.js login",
     "start": "node dist/cli.js start",
     "typecheck": "tsc --noEmit",
-    "test": "node --test dist/**/*.test.js"
+    "test": "node --test \"dist/**/*.test.js\"",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run build"
   },
   "engines": {
     "node": ">=18"
+  },
+  "keywords": [
+    "echoai",
+    "wechat",
+    "weixin",
+    "channel",
+    "chatbot",
+    "agent",
+    "ilink"
+  ],
+  "author": "EchoWorker",
+  "license": "MIT",
+  "homepage": "https://github.com/EchoWorker/EchoAIExtensions/tree/main/Channels/wechat#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/EchoWorker/EchoAIExtensions.git",
+    "directory": "Channels/wechat"
+  },
+  "bugs": {
+    "url": "https://github.com/EchoWorker/EchoAIExtensions/issues"
   },
   "dependencies": {
     "qrcode": "^1.5.4",
@@ -33,6 +63,5 @@
     "@types/qrcode-terminal": "^0.12.2",
     "@types/ws": "^8.5.12",
     "typescript": "^5.6.0"
-  },
-  "license": "MIT"
+  }
 }
