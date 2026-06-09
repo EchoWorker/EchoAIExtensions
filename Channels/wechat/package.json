@@ -1,0 +1,38 @@
+{
+  "name": "echo-wechat",
+  "version": "0.1.0",
+  "description": "WeChat channel for EchoAI — connects a personal WeChat account to an EchoAI agent.",
+  "type": "module",
+  "comment_ilink": "iLink protocol fields read by src/protocol/api/api.ts. ilink_appid identifies this as the WeChat plugin's own package.json; ilink_client_version feeds the iLink-App-ClientVersion header. Keep aligned with the vendored protocol layer (upstream @tencent-weixin/openclaw-weixin 2.4.4).",
+  "ilink_appid": "bot",
+  "ilink_client_version": "2.4.4",
+  "bin": {
+    "echo-wechat": "dist/cli.js"
+  },
+  "main": "dist/cli.js",
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "login": "node dist/cli.js login",
+    "start": "node dist/cli.js start",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test dist/**/*.test.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "qrcode": "^1.5.4",
+    "qrcode-terminal": "0.12.0",
+    "silk-wasm": "^3.6.1",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "@types/qrcode": "^1.5.6",
+    "@types/qrcode-terminal": "^0.12.2",
+    "@types/ws": "^8.5.12",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT"
+}

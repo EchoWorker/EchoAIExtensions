@@ -1,0 +1,31 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+*.tsbuildinfo
+
+# Logs
+*.log
+logs/
+
+# Vendor source archives (fetch from npm instead; see NOTICE.md)
+**/vendor-src/
+*.tgz
+
+# Probe / scratch dirs
+**/_probe/
+**/_src/
+**/_probe2/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Env / secrets (never commit)
+.env
+.env.*
+*.local

@@ -1,0 +1,343 @@
+/**
+ * orchestrator.ts — glue between WeChat (protocol layer) and EchoAI (gateway).
+ *
+ * Responsibilities (mirrors the proven Python echobot_wechat.plugin):
+ *   - long-poll getUpdates for inbound WeChat messages
+ *   - turn each inbound message into a gateway turn (chat.completions / enqueue)
+ *   - on the agent's reply, send it back to the originating WeChat user
+ *   - resolve a per-conversation session_key (channel:session is one-to-many)
+ *   - persist the getUpdates cursor + the per-user context_token (needed to reply)
+ *
+ * Media (inbound attachments + outbound files) is added in W5.
+ */
+
+import { randomUUID } from "node:crypto";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+
+import {
+  getUpdates,
+  sendMessage,
+  notifyStart,
+  notifyStop,
+} from "./protocol/api/api.js";
+import type { WeixinMessage, MessageItem } from "./protocol/api/types.js";
+import { weixinMessageToMsgContext, isMediaItem, type WeixinMsgContext } from "./protocol/messaging/inbound.js";
+import { downloadMediaFromItem } from "./protocol/media/media-download.js";
+import { sendWeixinMediaFile } from "./protocol/messaging/send-media.js";
+import {
+  getSyncBufFilePath,
+  loadGetUpdatesBuf,
+  saveGetUpdatesBuf,
+} from "./protocol/storage/sync-buf.js";
+import { resolveStateDir } from "./protocol/storage/state-dir.js";
+import { logger } from "./protocol/util/logger.js";
+import { GatewayClient, type GatewayReply } from "./gateway-client.js";
+
+export type OrchestratorOptions = {
+  accountId: string;
+  baseUrl: string;
+  cdnBaseUrl: string;
+  token: string;
+  gateway: GatewayClient;
+  /**
+   * session_key template. `{from_user}` is replaced with the WeChat user id.
+   *   ""                    → per-peer (default): each conversation is its own session
+   *   "wechat:{from_user}"  → namespaced per-peer
+   *   "wechat:shared"       → single shared session for all peers
+   */
+  sessionKeyTemplate?: string;
+};
+
+const DEFAULT_LONG_POLL_TIMEOUT_MS = 30_000;
+const ERROR_BACKOFF_MS = 5_000;
+
+export class Orchestrator {
+  private readonly accountId: string;
+  private readonly baseUrl: string;
+  private readonly cdnBaseUrl: string;
+  private readonly token: string;
+  private readonly gateway: GatewayClient;
+  private readonly sessionKeyTemplate: string;
+  private readonly mediaTmpDir: string;
+
+  private readonly syncBufPath: string;
+  private getUpdatesBuf: string;
+
+  /** session_key → WeChat user id (to_user for replies). */
+  private readonly sessionToUser = new Map<string, string>();
+  /** WeChat user id → latest context_token (required by sendMessage). */
+  private readonly userContextToken = new Map<string, string>();
+
+  private running = false;
+
+  constructor(opts: OrchestratorOptions) {
+    this.accountId = opts.accountId;
+    this.baseUrl = opts.baseUrl;
+    this.cdnBaseUrl = opts.cdnBaseUrl;
+    this.token = opts.token;
+    this.gateway = opts.gateway;
+    this.sessionKeyTemplate = opts.sessionKeyTemplate ?? "";
+
+    this.mediaTmpDir = path.join(resolveStateDir(), "media-tmp");
+    fs.mkdirSync(this.mediaTmpDir, { recursive: true });
+
+    this.syncBufPath = getSyncBufFilePath(this.accountId);
+    this.getUpdatesBuf = loadGetUpdatesBuf(this.syncBufPath) ?? "";
+  }
+
+  /** Resolve the EchoAI session_key for a WeChat user, per the template. */
+  private resolveSessionKey(fromUser: string): string {
+    const tmpl = this.sessionKeyTemplate.trim();
+    if (!tmpl) return fromUser; // per-peer default
+    return tmpl.replace(/\{from_user\}/g, fromUser);
+  }
+
+  async start(): Promise<void> {
+    this.running = true;
+    try {
+      await notifyStart({ baseUrl: this.baseUrl, token: this.token });
+    } catch (e) {
+      logger.warn(`orchestrator: notifyStart failed (continuing): ${String(e)}`);
+    }
+    logger.info(`orchestrator: started for account=${this.accountId}`);
+    await this.pollLoop();
+  }
+
+  async stop(): Promise<void> {
+    this.running = false;
+    try {
+      await notifyStop({ baseUrl: this.baseUrl, token: this.token });
+    } catch {
+      // best-effort
+    }
+  }
+
+  // ── inbound long-poll loop ───────────────────────────────────────────────
+
+  private async pollLoop(): Promise<void> {
+    let timeout = DEFAULT_LONG_POLL_TIMEOUT_MS;
+
+    while (this.running) {
+      let resp;
+      try {
+        resp = await getUpdates({
+          baseUrl: this.baseUrl,
+          token: this.token,
+          get_updates_buf: this.getUpdatesBuf,
+          timeoutMs: timeout,
+        });
+      } catch (e) {
+        logger.warn(`orchestrator: getUpdates error: ${String(e)}`);
+        await delay(ERROR_BACKOFF_MS);
+        continue;
+      }
+
+      if (resp.ret !== undefined && resp.ret !== 0) {
+        logger.error(`orchestrator: getUpdates ret=${resp.ret} errcode=${resp.errcode} errmsg=${resp.errmsg}`);
+        await delay(ERROR_BACKOFF_MS);
+        continue;
+      }
+
+      if (resp.longpolling_timeout_ms && resp.longpolling_timeout_ms > 0) {
+        timeout = resp.longpolling_timeout_ms;
+      }
+
+      // Persist the cursor as soon as it advances.
+      if (resp.get_updates_buf && resp.get_updates_buf !== this.getUpdatesBuf) {
+        this.getUpdatesBuf = resp.get_updates_buf;
+        try {
+          saveGetUpdatesBuf(this.syncBufPath, this.getUpdatesBuf);
+        } catch (e) {
+          logger.warn(`orchestrator: failed to persist sync buf: ${String(e)}`);
+        }
+      }
+
+      for (const msg of resp.msgs ?? []) {
+        // Handle each message independently; never let one failure stall the loop.
+        void this.handleInbound(msg).catch((e) =>
+          logger.error(`orchestrator: handleInbound failed: ${String(e)}`),
+        );
+      }
+    }
+  }
+
+  // ── inbound → gateway ─────────────────────────────────────────────────────
+
+  private async handleInbound(msg: WeixinMessage): Promise<void> {
+    const fromUser = (msg.from_user_id ?? "").trim();
+    if (!fromUser) return;
+
+    const ctx: WeixinMsgContext = weixinMessageToMsgContext(msg, this.accountId);
+
+    // Remember the context_token — required to send replies back to this user.
+    const contextToken = (msg.context_token ?? ctx.context_token ?? "").trim();
+    if (contextToken) {
+      this.userContextToken.set(fromUser, contextToken);
+    }
+
+    // Download any media items → local temp files → pass as attachments.
+    const attachments = await this.downloadInboundMedia(msg);
+
+    const text = (ctx.Body ?? "").trim();
+    if (!text && attachments.length === 0) {
+      logger.info(`orchestrator: inbound from=${fromUser} had no usable content`);
+      return;
+    }
+
+    const sessionKey = this.resolveSessionKey(fromUser);
+    this.sessionToUser.set(sessionKey, fromUser);
+
+    // When media-only, give the agent a hint so it knows a file arrived.
+    const content = text || (attachments.length ? `[${attachments.length} media file(s)]` : "");
+
+    logger.info(
+      `orchestrator: inbound from=${fromUser} session=${sessionKey} text=${truncate(text, 80)} media=${attachments.length}`,
+    );
+
+    try {
+      await this.gateway.submit(sessionKey, content, attachments.map((p) => ({ path: p })));
+    } catch (e) {
+      logger.error(`orchestrator: gateway.submit failed: ${String(e)}`);
+      await this.sendText(fromUser, "（暂时无法处理你的消息，请稍后再试）").catch(() => {});
+    }
+  }
+
+  /** Download every media item in a message to local temp files. */
+  private async downloadInboundMedia(msg: WeixinMessage): Promise<string[]> {
+    const items = (msg.item_list ?? []).filter((it): it is MessageItem => isMediaItem(it));
+    if (items.length === 0) return [];
+
+    const paths: string[] = [];
+    for (const item of items) {
+      try {
+        const media = await downloadMediaFromItem(item, {
+          cdnBaseUrl: this.cdnBaseUrl,
+          saveMedia: async (buffer, contentType, _subdir, _maxBytes, originalFilename) => {
+            const ext = extFor(contentType, originalFilename);
+            const name = `${Date.now()}-${randomUUID().slice(0, 8)}${ext}`;
+            const dest = path.join(this.mediaTmpDir, name);
+            await fs.promises.writeFile(dest, buffer);
+            return { path: dest };
+          },
+          log: (m) => logger.debug(`media: ${m}`),
+          errLog: (m) => logger.warn(`media: ${m}`),
+          label: "inbound",
+        });
+        const p =
+          media.decryptedPicPath ??
+          media.decryptedFilePath ??
+          media.decryptedVideoPath ??
+          media.decryptedVoicePath;
+        if (p) paths.push(p);
+      } catch (e) {
+        logger.warn(`orchestrator: media download failed: ${String(e)}`);
+      }
+    }
+    return paths;
+  }
+
+  // ── gateway reply → WeChat ────────────────────────────────────────────────
+
+  /** Wire this as the GatewayClient onReply handler. */
+  onGatewayReply = async (reply: GatewayReply): Promise<void> => {
+    const toUser = this.sessionToUser.get(reply.sessionKey);
+    if (!toUser) {
+      logger.warn(`orchestrator: reply for unknown session=${reply.sessionKey}, dropping`);
+      return;
+    }
+    const media = reply.media ?? [];
+    if (media.length > 0) {
+      // Send each file; attach the text as a caption on the first one.
+      for (let i = 0; i < media.length; i++) {
+        const caption = i === 0 ? reply.text : "";
+        await this.sendMedia(toUser, media[i], caption);
+      }
+      return;
+    }
+    if (reply.text) {
+      await this.sendText(toUser, reply.text);
+    }
+  };
+
+  private async sendMedia(toUser: string, filePath: string, caption: string): Promise<void> {
+    const contextToken = this.userContextToken.get(toUser) ?? "";
+    try {
+      await sendWeixinMediaFile({
+        filePath,
+        to: toUser,
+        text: caption,
+        opts: { baseUrl: this.baseUrl, token: this.token, contextToken },
+        cdnBaseUrl: this.cdnBaseUrl,
+      });
+      logger.info(`orchestrator: sent media → ${toUser} file=${path.basename(filePath)}`);
+    } catch (e) {
+      logger.error(`orchestrator: sendMedia → ${toUser} failed: ${String(e)}`);
+      // Fall back to at least delivering the caption text.
+      if (caption) await this.sendText(toUser, caption).catch(() => {});
+    }
+  }
+
+  private async sendText(toUser: string, text: string): Promise<void> {
+    const contextToken = this.userContextToken.get(toUser) ?? "";
+    try {
+      await sendMessage({
+        baseUrl: this.baseUrl,
+        token: this.token,
+        body: {
+          msg: {
+            from_user_id: "",
+            to_user_id: toUser,
+            client_id: generateClientId(),
+            message_type: 2, // BOT
+            message_state: 2, // FINISH
+            context_token: contextToken,
+            item_list: [{ type: 1, text_item: { text } }],
+          },
+        },
+      });
+      logger.info(`orchestrator: sent reply → ${toUser} (${text.length} chars)`);
+    } catch (e) {
+      logger.error(`orchestrator: sendText → ${toUser} failed: ${String(e)}`);
+    }
+  }
+}
+
+function generateClientId(): string {
+  return randomUUID().replace(/-/g, "");
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function truncate(s: string, n: number): string {
+  return s.length <= n ? s : `${s.slice(0, n)}…`;
+}
+
+/** Pick a file extension from content-type or original filename. */
+function extFor(contentType?: string, originalFilename?: string): string {
+  if (originalFilename) {
+    const e = path.extname(originalFilename);
+    if (e) return e;
+  }
+  switch (contentType) {
+    case "image/jpeg":
+      return ".jpg";
+    case "image/png":
+      return ".png";
+    case "image/gif":
+      return ".gif";
+    case "image/webp":
+      return ".webp";
+    case "video/mp4":
+      return ".mp4";
+    case "audio/wav":
+      return ".wav";
+    case "audio/silk":
+      return ".silk";
+    default:
+      return ".bin";
+  }
+}
