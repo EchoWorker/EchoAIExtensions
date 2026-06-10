@@ -60,6 +60,12 @@ type Pending = {
 const RPC_TIMEOUT_MS = 30_000;
 const RECONNECT_BASE_MS = 1_000;
 const RECONNECT_CAP_MS = 30_000;
+/**
+ * How long submit() waits for a mid-reconnect socket to come back before
+ * surfacing a failure. Covers transient drops / gateway restarts so the user
+ * doesn't see an error for a blip; a genuine outage still fails after this.
+ */
+const SUBMIT_CONNECT_WAIT_MS = 8_000;
 
 export class GatewayClient {
   private ws: WebSocket | null = null;
@@ -124,6 +130,17 @@ export class GatewayClient {
       } catch (e) {
         logger.warn(`gateway: chat.enqueue failed, falling back to new turn: ${String(e)}`);
         // fall through to a fresh completion
+      }
+    }
+
+    // The socket may be mid-reconnect (gateway restart, transient drop). Wait
+    // briefly for it to come back before giving up — the error notice the
+    // orchestrator shows is meant for genuine failures, not a 1s blip.
+    if (!this.connected) {
+      try {
+        await this.waitConnected(SUBMIT_CONNECT_WAIT_MS);
+      } catch {
+        throw new Error(`gateway: not connected (cannot chat.completions for ${sessionKey})`);
       }
     }
 
