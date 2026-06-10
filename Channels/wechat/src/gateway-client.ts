@@ -85,6 +85,14 @@ export class GatewayClient {
 
   // ── inbound → agent ─────────────────────────────────────────────────────
 
+  /** Optional per-call overrides on chat.completions. */
+  public submitOpts: {
+    /** EchoAI model id; persisted to session if non-empty. */
+    model?: string;
+    /** Absolute workspace path; sets agent cwd. */
+    workspace?: string;
+  } = {};
+
   /**
    * Submit an inbound platform message. Starts a new turn, or steers the
    * running one if a turn is already active for this session.
@@ -114,6 +122,8 @@ export class GatewayClient {
         content,
         headless: true,
       };
+      if (this.submitOpts.model) params.model = this.submitOpts.model;
+      if (this.submitOpts.workspace) params.workspace = this.submitOpts.workspace;
       if (attachments && attachments.length > 0) {
         params.attachments = attachments.map((a) => a.path);
       }
@@ -121,6 +131,27 @@ export class GatewayClient {
     } catch (e) {
       this.turnText.delete(sessionKey);
       throw e;
+    }
+  }
+
+  /** List EchoAI's available models + default. Used for --model validation at startup. */
+  async listModels(): Promise<{ models: Array<{ id: string }>; default_model: string }> {
+    const result = (await this.rpc("model.list", {})) as
+      | { models?: Array<{ id?: string }>; default_model?: string }
+      | undefined;
+    const models = (result?.models ?? [])
+      .map((m) => ({ id: String(m.id ?? "") }))
+      .filter((m) => m.id !== "");
+    return { models, default_model: result?.default_model ?? "" };
+  }
+
+  /** Resolve when plugin.connect has succeeded. Used to gate startup-time RPCs. */
+  async waitConnected(timeoutMs = 10_000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!this.connected) {
+      if (this.closing) throw new Error("gateway: client closed before connection");
+      if (Date.now() > deadline) throw new Error(`gateway: not connected after ${timeoutMs}ms`);
+      await delay(50);
     }
   }
 

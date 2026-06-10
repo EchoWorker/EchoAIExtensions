@@ -42,12 +42,15 @@ export type OrchestratorOptions = {
   token: string;
   gateway: GatewayClient;
   /**
-   * session_key template. `{from_user}` is replaced with the WeChat user id.
-   *   ""                    → per-peer (default): each conversation is its own session
-   *   "wechat:{from_user}"  → namespaced per-peer
-   *   "wechat:shared"       → single shared session for all peers
+   * EchoAI session_key for this bot. A WeChat bot account only receives
+   * messages from one fixed peer, so the channel uses a single session_key
+   * for the whole process lifetime (default: `wechat:<accountId>`).
    */
-  sessionKeyTemplate?: string;
+  sessionKey: string;
+  /** EchoAI model id; per-turn override on chat.completions. */
+  defaultModel?: string;
+  /** Absolute workspace path; per-turn override on chat.completions. */
+  defaultWorkspace?: string;
 };
 
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 30_000;
@@ -59,14 +62,14 @@ export class Orchestrator {
   private readonly cdnBaseUrl: string;
   private readonly token: string;
   private readonly gateway: GatewayClient;
-  private readonly sessionKeyTemplate: string;
+  private readonly sessionKey: string;
   private readonly mediaTmpDir: string;
 
   private readonly syncBufPath: string;
   private getUpdatesBuf: string;
 
-  /** session_key → WeChat user id (to_user for replies). */
-  private readonly sessionToUser = new Map<string, string>();
+  /** Most recent peer who messaged us (to_user for replies). */
+  private lastFromUser = "";
   /** WeChat user id → latest context_token (required by sendMessage). */
   private readonly userContextToken = new Map<string, string>();
 
@@ -78,20 +81,19 @@ export class Orchestrator {
     this.cdnBaseUrl = opts.cdnBaseUrl;
     this.token = opts.token;
     this.gateway = opts.gateway;
-    this.sessionKeyTemplate = opts.sessionKeyTemplate ?? "";
+    this.sessionKey = opts.sessionKey;
+
+    // Per-turn overrides flow to the gateway through this shared bag.
+    this.gateway.submitOpts = {
+      model: opts.defaultModel,
+      workspace: opts.defaultWorkspace,
+    };
 
     this.mediaTmpDir = path.join(resolveStateDir(), "media-tmp");
     fs.mkdirSync(this.mediaTmpDir, { recursive: true });
 
     this.syncBufPath = getSyncBufFilePath(this.accountId);
     this.getUpdatesBuf = loadGetUpdatesBuf(this.syncBufPath) ?? "";
-  }
-
-  /** Resolve the EchoAI session_key for a WeChat user, per the template. */
-  private resolveSessionKey(fromUser: string): string {
-    const tmpl = this.sessionKeyTemplate.trim();
-    if (!tmpl) return fromUser; // per-peer default
-    return tmpl.replace(/\{from_user\}/g, fromUser);
   }
 
   async start(): Promise<void> {
@@ -186,18 +188,20 @@ export class Orchestrator {
       return;
     }
 
-    const sessionKey = this.resolveSessionKey(fromUser);
-    this.sessionToUser.set(sessionKey, fromUser);
+    // WeChat bot accounts only ever talk to one fixed peer (1:1), so the
+    // session_key is a process-lifetime constant. We just remember the latest
+    // from_user so replies routed back via onGatewayReply hit the right inbox.
+    this.lastFromUser = fromUser;
 
     // When media-only, give the agent a hint so it knows a file arrived.
     const content = text || (attachments.length ? `[${attachments.length} media file(s)]` : "");
 
     logger.info(
-      `orchestrator: inbound from=${fromUser} session=${sessionKey} text=${truncate(text, 80)} media=${attachments.length}`,
+      `orchestrator: inbound from=${fromUser} session=${this.sessionKey} text=${truncate(text, 80)} media=${attachments.length}`,
     );
 
     try {
-      await this.gateway.submit(sessionKey, content, attachments.map((p) => ({ path: p })));
+      await this.gateway.submit(this.sessionKey, content, attachments.map((p) => ({ path: p })));
     } catch (e) {
       logger.error(`orchestrator: gateway.submit failed: ${String(e)}`);
       await this.sendText(fromUser, "（暂时无法处理你的消息，请稍后再试）").catch(() => {});
@@ -242,9 +246,17 @@ export class Orchestrator {
 
   /** Wire this as the GatewayClient onReply handler. */
   onGatewayReply = async (reply: GatewayReply): Promise<void> => {
-    const toUser = this.sessionToUser.get(reply.sessionKey);
+    // sessionKey is process-constant; the only routing fact we need is who to
+    // send back to, which is whoever last messaged us.
+    if (reply.sessionKey !== this.sessionKey) {
+      logger.warn(
+        `orchestrator: reply for unexpected session=${reply.sessionKey} (expected ${this.sessionKey}), dropping`,
+      );
+      return;
+    }
+    const toUser = this.lastFromUser;
     if (!toUser) {
-      logger.warn(`orchestrator: reply for unknown session=${reply.sessionKey}, dropping`);
+      logger.warn(`orchestrator: reply arrived but no peer has messaged yet, dropping`);
       return;
     }
     const media = reply.media ?? [];

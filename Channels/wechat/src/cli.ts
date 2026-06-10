@@ -6,11 +6,16 @@
  *   login   Interactive QR login (run in a terminal). Saves the bot token.
  *   start   Connect to the EchoAI gateway and run. Spawned headless by EchoAI.
  *
+ * `start` accepts the following flags (all optional):
+ *   --session-key <key>     EchoAI session_key for this bot (default: wechat:<accountId>)
+ *   --model <id>            EchoAI model id; validated against gateway model.list at startup
+ *   --workspace <abs-path>  absolute workspace path for the agent's cwd
+ *
  * Run with no subcommand → prints help.
  */
 
 import { runLogin } from "./commands/login.js";
-import { runStart } from "./commands/start.js";
+import { runStart, type StartOptions } from "./commands/start.js";
 
 function printHelp(): void {
   process.stdout.write(
@@ -18,8 +23,13 @@ function printHelp(): void {
       "echo-wechat — WeChat channel for EchoAI",
       "",
       "Usage:",
-      "  echo-wechat login    Interactive QR login (scan in a terminal); saves the bot token.",
-      "  echo-wechat start    Connect to the EchoAI gateway and run (spawned by EchoAI).",
+      "  echo-wechat login                              Interactive QR login (scan in a terminal); saves the bot token.",
+      "  echo-wechat start [flags]                      Connect to the EchoAI gateway and run (spawned by EchoAI).",
+      "",
+      "`start` flags (all optional):",
+      "  --session-key <key>      EchoAI session_key for this bot (default: wechat:<accountId>)",
+      "  --model <id>             EchoAI model id; validated against gateway model.list at startup",
+      "  --workspace <abs-path>   absolute workspace path for the agent's cwd",
       "",
       "Env (read by `start`, injected by EchoAI):",
       "  ECHOAI_GATEWAY_URL    gateway WebSocket url",
@@ -28,10 +38,47 @@ function printHelp(): void {
       "",
       "Optional env:",
       "  ECHO_WECHAT_STATE_DIR   override state dir (default ~/.echoai/channels/wechat)",
-      "  ECHO_WECHAT_SESSION_KEY  session key template, e.g. 'wechat:{from_user}' (default: per-peer)",
       "",
     ].join("\n"),
   );
+}
+
+/** Parse `start` flags out of argv. Bails with stderr+exit on unknown / missing-value flags. */
+function parseStartArgs(argv: string[]): StartOptions {
+  const opts: StartOptions = {};
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i];
+    const next = (): string => {
+      const v = argv[i + 1];
+      if (v == null || v.startsWith("--")) {
+        process.stderr.write(`echo-wechat start: flag ${arg} requires a value\n`);
+        process.exit(2);
+      }
+      i += 2;
+      return v;
+    };
+    switch (arg) {
+      case "--session-key":
+        opts.sessionKey = next();
+        break;
+      case "--model":
+        opts.model = next();
+        break;
+      case "--workspace":
+        opts.workspace = next();
+        break;
+      case "-h":
+      case "--help":
+        printHelp();
+        process.exit(0);
+      default:
+        process.stderr.write(`echo-wechat start: unknown flag: ${arg}\n\n`);
+        printHelp();
+        process.exit(2);
+    }
+  }
+  return opts;
 }
 
 async function main(): Promise<void> {
@@ -40,9 +87,11 @@ async function main(): Promise<void> {
     case "login":
       await runLogin();
       break;
-    case "start":
-      await runStart();
+    case "start": {
+      const opts = parseStartArgs(process.argv.slice(3));
+      await runStart(opts);
       break;
+    }
     case undefined:
     case "-h":
     case "--help":

@@ -2,10 +2,12 @@
  * gateway-client.test.ts — protocol conformance test for GatewayClient.
  *
  * Spins a mock EchoAI gateway (hand-rolled RFC6455 WS server, no deps), then:
- *   - asserts the client sends auth + plugin.connect{plugin_type:"channel"}
- *   - on chat.completions, streams back token/append deltas then turn/end
- *   - asserts GatewayClient.onReply fires once with the accumulated text
- *   - asserts subagent_task_id deltas are NOT included
+ *   - asserts the client sends auth + plugin.connect{plugin_type:"channel",
+ *     disable_questions:true, NO headless}
+ *   - on chat.completions, asserts headless:true + optional model/workspace
+ *     are forwarded; streams back token deltas then turn/end
+ *   - asserts subagent_task_id deltas are NOT included in the accumulated reply
+ *   - covers model.list (used by --model validation at startup)
  *
  * Run: node --test dist/gateway-client.test.js   (after build)
  */
@@ -47,15 +49,26 @@ function encodeFrame(str: string): Buffer {
   return Buffer.concat([header, payload]);
 }
 
+type GatewayRequest = { method: string; params: Record<string, unknown> };
+
+type MockGatewayOpts = {
+  /** If set, replied to `model.list` with this. Otherwise model.list returns the default scaffold. */
+  models?: { models: Array<{ id: string }>; default_model: string };
+  /** If true, mock gateway streams reply on chat.completions (default). */
+  streamReply?: boolean;
+};
+
 type MockGateway = {
   server: Server;
   url: string;
-  seen: string[];
+  /** All RPCs the gateway received, in order, with full params. */
+  requests: GatewayRequest[];
   close: () => void;
 };
 
-async function startMockGateway(): Promise<MockGateway> {
-  const seen: string[] = [];
+async function startMockGateway(opts: MockGatewayOpts = {}): Promise<MockGateway> {
+  const requests: GatewayRequest[] = [];
+  const streamReply = opts.streamReply !== false;
   const server = createServer();
 
   server.on("upgrade", (req, socket: Socket) => {
@@ -82,38 +95,29 @@ async function startMockGateway(): Promise<MockGateway> {
       }
       const method = msg.method as string;
       const id = msg.id as number;
-      seen.push(method);
+      const params = (msg.params as Record<string, unknown>) ?? {};
+      requests.push({ method, params });
 
       if (method === "auth") {
         send({ jsonrpc: "2.0", id, result: { ok: true } });
       } else if (method === "plugin.connect") {
-        const params = msg.params as Record<string, unknown>;
-        assert.equal(params.plugin_type, "channel", "must register as channel");
-        assert.equal(
-          params.disable_questions,
-          true,
-          "plugin.connect must set disable_questions:true (no UI to render questions)",
-        );
-        assert.equal(
-          params.headless,
-          undefined,
-          "plugin.connect must NOT set headless (it's a per-turn flag on chat.completions; setting it here implies it works connection-wide which it doesn't)",
-        );
         send({ jsonrpc: "2.0", id, result: { status: "connected" } });
+      } else if (method === "model.list") {
+        const payload = opts.models ?? {
+          models: [{ id: "anthropic/claude-sonnet-4.6" }, { id: "openai/gpt-5.4" }],
+          default_model: "anthropic/claude-sonnet-4.6",
+        };
+        send({ jsonrpc: "2.0", id, result: payload });
       } else if (method === "chat.completions") {
-        const params = msg.params as Record<string, unknown>;
         const sk = params.session_key as string;
-        assert.equal(
-          params.headless,
-          true,
-          "chat.completions must set headless:true (no UI to answer tool-approval / plan-review)",
-        );
         send({ jsonrpc: "2.0", id, result: { session_key: sk, turn_id: "t1" } });
-        // Stream: a subagent delta (must be ignored) + two main deltas, then end.
-        send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "SUBAGENT", session_key: sk, subagent_task_id: "bg_1" } });
-        send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "Hello ", session_key: sk } });
-        send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "world", session_key: sk } });
-        send({ jsonrpc: "2.0", method: "chat.event", params: { type: "turn", event: "end", turn_id: "t1", status: "done", session_key: sk } });
+        if (streamReply) {
+          // Stream: a subagent delta (must be ignored) + two main deltas, then end.
+          send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "SUBAGENT", session_key: sk, subagent_task_id: "bg_1" } });
+          send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "Hello ", session_key: sk } });
+          send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "world", session_key: sk } });
+          send({ jsonrpc: "2.0", method: "chat.event", params: { type: "turn", event: "end", turn_id: "t1", status: "done", session_key: sk } });
+        }
       }
     });
   });
@@ -124,12 +128,23 @@ async function startMockGateway(): Promise<MockGateway> {
   return {
     server,
     url: `ws://127.0.0.1:${port}`,
-    seen,
+    requests,
     close: () => server.close(),
   };
 }
 
-test("GatewayClient: connect, submit, accumulate deltas, flush on turn end", async () => {
+async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (cond()) return;
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  throw new Error("waitFor: timed out");
+}
+
+// ── tests ────────────────────────────────────────────────────────────
+
+test("GatewayClient: connect → submit → accumulate deltas → flush on turn end", async () => {
   const gw = await startMockGateway();
   const replies: Array<{ sessionKey: string; text: string }> = [];
 
@@ -141,30 +156,101 @@ test("GatewayClient: connect, submit, accumulate deltas, flush on turn end", asy
       replies.push(r);
     },
   });
-
   void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
 
-  // Wait until registered (plugin.connect seen), then submit.
-  await waitFor(() => gw.seen.includes("plugin.connect"), 3000);
+  // plugin.connect contract: register as channel, suppress questions, NO
+  // headless (that flag is per-turn on chat.completions; setting it here
+  // implies it works connection-wide which it doesn't).
+  const connect = gw.requests.find((r) => r.method === "plugin.connect")!;
+  assert.equal(connect.params.plugin_type, "channel");
+  assert.equal(connect.params.disable_questions, true);
+  assert.equal(connect.params.headless, undefined, "plugin.connect must NOT set headless");
+
   await client.submit("peer-1", "hi");
-
   await waitFor(() => replies.length > 0, 3000);
 
-  assert.equal(replies.length, 1, "exactly one reply");
+  // chat.completions contract: must set headless:true (no UI to answer
+  // tool-approval / plan-review prompts).
+  const chat = gw.requests.find((r) => r.method === "chat.completions")!;
+  assert.equal(chat.params.session_key, "peer-1");
+  assert.equal(chat.params.content, "hi");
+  assert.equal(chat.params.headless, true, "chat.completions must set headless:true");
+  // model/workspace not set when submitOpts is empty.
+  assert.equal(chat.params.model, undefined);
+  assert.equal(chat.params.workspace, undefined);
+
+  assert.equal(replies.length, 1);
   assert.equal(replies[0].sessionKey, "peer-1");
   assert.equal(replies[0].text, "Hello world", "subagent delta excluded, main deltas joined");
-  assert.ok(gw.seen.includes("auth"), "sent auth");
-  assert.ok(gw.seen.includes("plugin.connect"), "sent plugin.connect");
 
   client.close();
   gw.close();
 });
 
-async function waitFor(cond: () => boolean, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (cond()) return;
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  throw new Error("waitFor: timed out");
-}
+test("GatewayClient: submit forwards model + workspace from submitOpts", async () => {
+  const gw = await startMockGateway();
+  const replies: Array<{ sessionKey: string; text: string }> = [];
+
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "test-token",
+    pluginName: "channel.wechat.test",
+    onReply: (r) => {
+      replies.push(r);
+    },
+  });
+  // Mimic Orchestrator wiring: per-call overrides are read off submitOpts.
+  client.submitOpts = {
+    model: "anthropic/claude-opus-4.7-1m",
+    workspace: "/abs/path/to/proj",
+  };
+
+  void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
+
+  await client.submit("peer-1", "hi");
+  await waitFor(() => replies.length > 0, 3000);
+
+  const chat = gw.requests.find((r) => r.method === "chat.completions")!;
+  assert.equal(chat.params.model, "anthropic/claude-opus-4.7-1m", "model passed through");
+  assert.equal(chat.params.workspace, "/abs/path/to/proj", "workspace passed through");
+  assert.equal(chat.params.headless, true);
+
+  client.close();
+  gw.close();
+});
+
+test("GatewayClient.listModels: returns gateway-provided model.list result", async () => {
+  const customModels = {
+    models: [
+      { id: "openai/gpt-5.5" },
+      { id: "anthropic/claude-opus-4.7" },
+      // ill-formed entries should be filtered out.
+      { id: "" },
+      { id: undefined as unknown as string },
+    ],
+    default_model: "anthropic/claude-opus-4.7",
+  };
+  const gw = await startMockGateway({ models: customModels, streamReply: false });
+
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "test-token",
+    pluginName: "channel.wechat.test",
+    onReply: () => {},
+  });
+  void client.start();
+  await client.waitConnected(3000);
+
+  const result = await client.listModels();
+  assert.deepEqual(
+    result.models.map((m) => m.id),
+    ["openai/gpt-5.5", "anthropic/claude-opus-4.7"],
+    "ill-formed entries filtered, order preserved",
+  );
+  assert.equal(result.default_model, "anthropic/claude-opus-4.7");
+
+  client.close();
+  gw.close();
+});
