@@ -107,7 +107,13 @@ export class GatewayClient {
 
     this.turnText.set(sessionKey, "");
     try {
-      const params: Record<string, unknown> = { session_key: sessionKey, content };
+      // headless=true: this channel has no UI to answer tool-approval / plan-
+      // review prompts, so let EchoCode auto-approve them (synthetic_auto_answer).
+      const params: Record<string, unknown> = {
+        session_key: sessionKey,
+        content,
+        headless: true,
+      };
       if (attachments && attachments.length > 0) {
         params.attachments = attachments.map((a) => a.path);
       }
@@ -182,11 +188,14 @@ export class GatewayClient {
     if (this.opts.token) {
       await this.rpc("auth", { token: this.opts.token });
     }
+    // Note: headless is set per-turn on chat.completions (the only place it
+    // actually drives synthetic_auto_answer in EchoAI's agent_loop). The
+    // headless flag on plugin.connect doesn't influence chat path — so we
+    // omit it here to avoid implying it does.
     await this.rpc("plugin.connect", {
       plugin_name: this.opts.pluginName,
       plugin_type: "channel",
       disable_questions: true,
-      headless: true,
     });
     this.connected = true;
     logger.info(`gateway: connected & registered as "${this.opts.pluginName}"`);

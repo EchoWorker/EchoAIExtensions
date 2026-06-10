@@ -89,10 +89,25 @@ async function startMockGateway(): Promise<MockGateway> {
       } else if (method === "plugin.connect") {
         const params = msg.params as Record<string, unknown>;
         assert.equal(params.plugin_type, "channel", "must register as channel");
+        assert.equal(
+          params.disable_questions,
+          true,
+          "plugin.connect must set disable_questions:true (no UI to render questions)",
+        );
+        assert.equal(
+          params.headless,
+          undefined,
+          "plugin.connect must NOT set headless (it's a per-turn flag on chat.completions; setting it here implies it works connection-wide which it doesn't)",
+        );
         send({ jsonrpc: "2.0", id, result: { status: "connected" } });
       } else if (method === "chat.completions") {
         const params = msg.params as Record<string, unknown>;
         const sk = params.session_key as string;
+        assert.equal(
+          params.headless,
+          true,
+          "chat.completions must set headless:true (no UI to answer tool-approval / plan-review)",
+        );
         send({ jsonrpc: "2.0", id, result: { session_key: sk, turn_id: "t1" } });
         // Stream: a subagent delta (must be ignored) + two main deltas, then end.
         send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "SUBAGENT", session_key: sk, subagent_task_id: "bg_1" } });
