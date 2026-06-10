@@ -35,6 +35,12 @@ export type GatewayReply = {
   text: string;
   /** Absolute local file paths to deliver as media (from agent send_message). */
   media?: string[];
+  /**
+   * When set, this reply is a terminal error notice for the turn — the
+   * orchestrator should surface a friendly message instead of (or after) any
+   * accumulated text. The raw cause is logged, not sent to the user.
+   */
+  isError?: boolean;
 };
 
 export type GatewayClientOptions = {
@@ -59,8 +65,16 @@ export class GatewayClient {
   private ws: WebSocket | null = null;
   private nextId = 1;
   private readonly pending = new Map<number, Pending>();
-  /** session_key → accumulated assistant text for the in-flight turn. */
-  private readonly turnText = new Map<string, string>();
+  /**
+   * session_key → current in-flight text segment. Mirrors EchoAI's
+   * steps.rs folding: tokens with the same message_id append to one segment;
+   * a new message_id (a new Step::Text in EchoAI, i.e. text resumed after a
+   * tool call) starts a fresh segment. Each completed segment is delivered to
+   * WeChat as its own message.
+   */
+  private readonly segments = new Map<string, { msgId: string; text: string }>();
+  /** session_keys with a turn currently running. */
+  private readonly activeTurns = new Set<string>();
   private connected = false;
   private closing = false;
   private reconnectAttempts = 0;
@@ -80,7 +94,7 @@ export class GatewayClient {
 
   /** Whether a turn is currently running for this session. */
   isTurnActive(sessionKey: string): boolean {
-    return this.turnText.has(sessionKey);
+    return this.activeTurns.has(sessionKey);
   }
 
   // ── inbound → agent ─────────────────────────────────────────────────────
@@ -98,7 +112,7 @@ export class GatewayClient {
    * running one if a turn is already active for this session.
    */
   async submit(sessionKey: string, content: string, attachments?: OutboundAttachment[]): Promise<void> {
-    if (this.turnText.has(sessionKey)) {
+    if (this.activeTurns.has(sessionKey)) {
       // A turn is running → steer it (C2: steer_id required).
       try {
         await this.rpc("chat.enqueue", {
@@ -113,7 +127,8 @@ export class GatewayClient {
       }
     }
 
-    this.turnText.set(sessionKey, "");
+    this.activeTurns.add(sessionKey);
+    this.segments.delete(sessionKey);
     try {
       // headless=true: this channel has no UI to answer tool-approval / plan-
       // review prompts, so let EchoCode auto-approve them (synthetic_auto_answer).
@@ -129,7 +144,8 @@ export class GatewayClient {
       }
       await this.rpc("chat.completions", params);
     } catch (e) {
-      this.turnText.delete(sessionKey);
+      this.activeTurns.delete(sessionKey);
+      this.segments.delete(sessionKey);
       throw e;
     }
   }
@@ -203,7 +219,8 @@ export class GatewayClient {
         }
         this.pending.clear();
         // Drop in-flight turn accumulation (server will restart turns).
-        this.turnText.clear();
+        this.segments.clear();
+        this.activeTurns.clear();
         logger.info("gateway: connection closed");
         resolve();
       });
@@ -277,21 +294,60 @@ export class GatewayClient {
     if (params.subagent_task_id) return;
 
     if (type === "token" && event === "append") {
+      // Mirror EchoAI steps.rs folding: tokens carry a message_id; the same id
+      // appends to the current segment, a new id starts a fresh one. A new id
+      // means EchoAI opened a new Step::Text (text resumed after a tool call),
+      // which is a natural paragraph boundary — flush the previous segment so
+      // it's delivered as its own WeChat message.
+      const msgId = (params.message_id as string | undefined) ?? "";
       const delta = (params.content as string | undefined) ?? "";
-      this.turnText.set(sessionKey, (this.turnText.get(sessionKey) ?? "") + delta);
-    } else if (type === "turn" && event === "end") {
-      const text = (this.turnText.get(sessionKey) ?? "").trim();
-      this.turnText.delete(sessionKey);
-      if (text) {
-        void Promise.resolve(this.opts.onReply({ sessionKey, text })).catch((e) =>
-          logger.error(`gateway: onReply failed: ${String(e)}`),
-        );
+      const seg = this.segments.get(sessionKey);
+      if (seg && seg.msgId === msgId) {
+        seg.text += delta;
+      } else {
+        if (seg) this.flushSegment(sessionKey); // boundary → deliver previous
+        this.segments.set(sessionKey, { msgId, text: delta });
       }
     } else if (type === "error" && event === "raise") {
+      // Record the cause; the friendly notice is emitted at turn/end. Flush any
+      // text accumulated before the error so it isn't lost.
       const message = (params.message as string | undefined) ?? "unknown error";
       logger.warn(`gateway: turn error for ${sessionKey}: ${message}`);
-      this.turnText.delete(sessionKey);
+      this.flushSegment(sessionKey);
+    } else if (type === "turn" && event === "end") {
+      const status = (params.status as string | undefined) ?? "done";
+      // Flush whatever text remains for this turn. We deliver accumulated text
+      // for every terminal status (done / cancelled / error): partial output
+      // is more useful to the user than silence.
+      this.flushSegment(sessionKey);
+
+      // error / fatal → append a friendly notice (raw cause stays in the log).
+      if (status === "error") {
+        void Promise.resolve(
+          this.opts.onReply({ sessionKey, text: "", isError: true }),
+        ).catch((e) => logger.error(`gateway: onReply (error notice) failed: ${String(e)}`));
+      }
+
+      this.activeTurns.delete(sessionKey);
+      this.segments.delete(sessionKey);
     }
+  }
+
+  /**
+   * Deliver the session's current text segment to the platform (one WeChat
+   * message) and clear it. No-op when the segment is empty / whitespace-only.
+   * Note: we intentionally do NOT trim — leading/trailing whitespace can be
+   * meaningful (code blocks, ASCII tables) — but skip delivery if the whole
+   * segment is blank.
+   */
+  private flushSegment(sessionKey: string): void {
+    const seg = this.segments.get(sessionKey);
+    if (!seg) return;
+    this.segments.delete(sessionKey);
+    if (seg.text.trim() === "") return; // nothing meaningful to send
+    void Promise.resolve(this.opts.onReply({ sessionKey, text: seg.text })).catch((e) =>
+      logger.error(`gateway: onReply failed: ${String(e)}`),
+    );
   }
 
   /** Agent-initiated send (send_message tool) — deliver directly, with media. */

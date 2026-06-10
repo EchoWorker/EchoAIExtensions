@@ -56,6 +56,9 @@ export type OrchestratorOptions = {
 const DEFAULT_LONG_POLL_TIMEOUT_MS = 30_000;
 const ERROR_BACKOFF_MS = 5_000;
 
+/** Friendly notice sent to the user when a turn ends in error (raw cause stays in the log). */
+const ERROR_NOTICE = "（处理出错了，请稍后再试）";
+
 export class Orchestrator {
   private readonly accountId: string;
   private readonly baseUrl: string;
@@ -257,6 +260,11 @@ export class Orchestrator {
     const toUser = this.lastFromUser;
     if (!toUser) {
       logger.warn(`orchestrator: reply arrived but no peer has messaged yet, dropping`);
+      return;
+    }
+    // Terminal error notice for the turn — friendly text, raw cause already logged.
+    if (reply.isError) {
+      await this.sendText(toUser, ERROR_NOTICE);
       return;
     }
     const media = reply.media ?? [];

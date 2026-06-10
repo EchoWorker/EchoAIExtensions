@@ -18,7 +18,7 @@ import { createServer, type Server } from "node:http";
 import { createHash } from "node:crypto";
 import type { Socket } from "node:net";
 
-import { GatewayClient } from "./gateway-client.js";
+import { GatewayClient, type GatewayReply } from "./gateway-client.js";
 
 function acceptKey(key: string): string {
   return createHash("sha1").update(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest("base64");
@@ -56,6 +56,12 @@ type MockGatewayOpts = {
   models?: { models: Array<{ id: string }>; default_model: string };
   /** If true, mock gateway streams reply on chat.completions (default). */
   streamReply?: boolean;
+  /**
+   * Custom chat.event sequence to stream on chat.completions, instead of the
+   * default Hello-world script. Each item's `session_key` is injected
+   * automatically. Use to exercise segmentation / error / status handling.
+   */
+  script?: Array<Record<string, unknown>>;
 };
 
 type MockGateway = {
@@ -111,7 +117,11 @@ async function startMockGateway(opts: MockGatewayOpts = {}): Promise<MockGateway
       } else if (method === "chat.completions") {
         const sk = params.session_key as string;
         send({ jsonrpc: "2.0", id, result: { session_key: sk, turn_id: "t1" } });
-        if (streamReply) {
+        if (opts.script) {
+          for (const ev of opts.script) {
+            send({ jsonrpc: "2.0", method: "chat.event", params: { ...ev, session_key: sk } });
+          }
+        } else if (streamReply) {
           // Stream: a subagent delta (must be ignored) + two main deltas, then end.
           send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "SUBAGENT", session_key: sk, subagent_task_id: "bg_1" } });
           send({ jsonrpc: "2.0", method: "chat.event", params: { type: "token", event: "append", content: "Hello ", session_key: sk } });
@@ -250,6 +260,131 @@ test("GatewayClient.listModels: returns gateway-provided model.list result", asy
     "ill-formed entries filtered, order preserved",
   );
   assert.equal(result.default_model, "anthropic/claude-opus-4.7");
+
+  client.close();
+  gw.close();
+});
+
+test("GatewayClient: segments split by message_id are delivered separately", async () => {
+  // EchoAI opens a new Step::Text (new message_id) when prose resumes after a
+  // tool call. Each segment must become its own WeChat message.
+  const gw = await startMockGateway({
+    script: [
+      { type: "token", event: "append", message_id: "m1", content: "First " },
+      { type: "token", event: "append", message_id: "m1", content: "paragraph." },
+      // tool call in between (ignored by the channel) → new message_id
+      { type: "tool", event: "create", message_id: "x", tool: "bash", tool_call_id: "c1" },
+      { type: "token", event: "append", message_id: "m2", content: "Second one." },
+      { type: "turn", event: "end", turn_id: "t1", status: "done" },
+    ],
+  });
+  const replies: GatewayReply[] = [];
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "t",
+    pluginName: "channel.wechat.test",
+    onReply: (r) => {
+      replies.push(r);
+    },
+  });
+  void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
+  await client.submit("peer-1", "hi");
+  await waitFor(() => replies.length >= 2, 3000);
+
+  assert.equal(replies.length, 2, "two segments → two messages");
+  assert.equal(replies[0].text, "First paragraph.", "first segment flushed at boundary, no trim");
+  assert.equal(replies[1].text, "Second one.", "second segment flushed at turn end");
+
+  client.close();
+  gw.close();
+});
+
+test("GatewayClient: error during turn flushes prior text then sends error notice", async () => {
+  const gw = await startMockGateway({
+    script: [
+      { type: "token", event: "append", message_id: "m1", content: "Partial answer" },
+      { type: "error", event: "raise", message: "llm 400 boom" },
+      { type: "turn", event: "end", turn_id: "t1", status: "error" },
+    ],
+  });
+  const replies: GatewayReply[] = [];
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "t",
+    pluginName: "channel.wechat.test",
+    onReply: (r) => {
+      replies.push(r);
+    },
+  });
+  void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
+  await client.submit("peer-1", "hi");
+  await waitFor(() => replies.length >= 2, 3000);
+
+  // First the accumulated text (flushed on error/raise), then a terminal error notice.
+  assert.equal(replies[0].text, "Partial answer");
+  assert.equal(replies[0].isError, undefined);
+  const errReply = replies.find((r) => r.isError);
+  assert.ok(errReply, "an isError reply is emitted");
+  assert.equal(errReply!.text, "", "error notice carries no model text (orchestrator supplies wording)");
+
+  client.close();
+  gw.close();
+});
+
+test("GatewayClient: cancelled turn still delivers already-accumulated text", async () => {
+  const gw = await startMockGateway({
+    script: [
+      { type: "token", event: "append", message_id: "m1", content: "Half a thought" },
+      { type: "turn", event: "end", turn_id: "t1", status: "cancelled" },
+    ],
+  });
+  const replies: GatewayReply[] = [];
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "t",
+    pluginName: "channel.wechat.test",
+    onReply: (r) => {
+      replies.push(r);
+    },
+  });
+  void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
+  await client.submit("peer-1", "hi");
+  await waitFor(() => replies.length >= 1, 3000);
+
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].text, "Half a thought");
+  assert.equal(replies[0].isError, undefined, "cancelled is not an error");
+
+  client.close();
+  gw.close();
+});
+
+test("GatewayClient: blank-only segment is not delivered", async () => {
+  const gw = await startMockGateway({
+    script: [
+      { type: "token", event: "append", message_id: "m1", content: "   \n  " },
+      { type: "turn", event: "end", turn_id: "t1", status: "done" },
+    ],
+  });
+  const replies: GatewayReply[] = [];
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "t",
+    pluginName: "channel.wechat.test",
+    onReply: (r) => {
+      replies.push(r);
+    },
+  });
+  void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
+  await client.submit("peer-1", "hi");
+  // give the stream time to arrive
+  await new Promise((r) => setTimeout(r, 500));
+
+  assert.equal(replies.length, 0, "whitespace-only segment must not produce a message");
 
   client.close();
   gw.close();
