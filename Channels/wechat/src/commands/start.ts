@@ -19,6 +19,7 @@ import {
 import { logger } from "../protocol/util/logger.js";
 import { GatewayClient } from "../gateway-client.js";
 import { Orchestrator } from "../orchestrator.js";
+import { readGatewayLock, gatewayLockPath } from "../gateway-lock.js";
 
 export type StartOptions = {
   /** EchoAI session_key for this bot. Defaults to `wechat:<accountId>`. */
@@ -30,13 +31,20 @@ export type StartOptions = {
 };
 
 export async function runStart(opts: StartOptions = {}): Promise<void> {
-  const gatewayUrl = process.env.ECHOAI_GATEWAY_URL?.trim();
-  const gatewayToken = process.env.ECHOAI_GATEWAY_TOKEN?.trim() ?? "";
+  // Gateway connection info comes from either:
+  //   1. env injected by EchoAI's ChannelSupervisor (the normal path), or
+  //   2. EchoAI's gateway.lock file (fallback — running `start` by hand).
+  const lock = readGatewayLock();
+  const gatewayUrl = process.env.ECHOAI_GATEWAY_URL?.trim() || lock?.url;
+  const gatewayToken = process.env.ECHOAI_GATEWAY_TOKEN?.trim() || lock?.token || "";
   const pluginName = process.env.ECHOAI_PLUGIN_NAME?.trim() || "channel.wechat";
 
   if (!gatewayUrl) {
-    process.stderr.write("echo-wechat start: ECHOAI_GATEWAY_URL not set — cannot connect to gateway.\n");
-    process.stderr.write("(This command is normally spawned by EchoAI, which injects the gateway env.)\n");
+    process.stderr.write("echo-wechat start: cannot find the EchoAI gateway.\n");
+    process.stderr.write(
+      `(No ECHOAI_GATEWAY_URL env, and no usable gateway.lock at ${gatewayLockPath()}.\n` +
+        " Start EchoAI first, or set ECHOAI_CONFIG_DIR if it uses a non-default config dir.)\n",
+    );
     process.exitCode = 1;
     return;
   }
@@ -137,12 +145,13 @@ export async function runStart(opts: StartOptions = {}): Promise<void> {
   }
 
   // ── Startup banner ────────────────────────────────────────────────
+  const gatewaySource = process.env.ECHOAI_GATEWAY_URL?.trim() ? "env" : "gateway.lock";
   const lines = [
     `echo-wechat: account=${account.accountId}`,
     `  session: ${sessionKey}`,
     `  workspace: ${workspace || "(none, agent will use EchoAI default cwd)"}`,
     `  model: ${model ? `${model} ✓` : "(session default)"}`,
-    `  gateway: ${gatewayUrl}`,
+    `  gateway: ${gatewayUrl} (via ${gatewaySource})`,
     `  plugin: ${pluginName}`,
   ];
   process.stdout.write(`${lines.join("\n")}\n`);
