@@ -4,7 +4,7 @@
  * Spins a mock EchoAI gateway (hand-rolled RFC6455 WS server, no deps), then:
  *   - asserts the client sends auth + plugin.connect{plugin_type:"channel",
  *     disable_questions:true, NO headless}
- *   - on chat.completions, asserts headless:true + optional model/workspace
+ *   - on chat.completions, asserts modes:['headless'] + optional model/workspace
  *     are forwarded; streams back token deltas then turn/end
  *   - asserts subagent_task_id deltas are NOT included in the accumulated reply
  *   - covers model.list (used by --model validation at startup)
@@ -180,12 +180,12 @@ test("GatewayClient: connect → submit → accumulate deltas → flush on turn 
   await client.submit("peer-1", "hi");
   await waitFor(() => replies.length > 0, 3000);
 
-  // chat.completions contract: must set headless:true (no UI to answer
+  // chat.completions contract: must set modes:['headless'] (no UI to answer
   // tool-approval / plan-review prompts).
   const chat = gw.requests.find((r) => r.method === "chat.completions")!;
   assert.equal(chat.params.session_key, "peer-1");
   assert.equal(chat.params.content, "hi");
-  assert.equal(chat.params.headless, true, "chat.completions must set headless:true");
+  assert.deepEqual(chat.params.modes, ["headless"], "chat.completions must set modes:['headless']");
   // model/workspace not set when submitOpts is empty.
   assert.equal(chat.params.model, undefined);
   assert.equal(chat.params.workspace, undefined);
@@ -225,7 +225,7 @@ test("GatewayClient: submit forwards model + workspace from submitOpts", async (
   const chat = gw.requests.find((r) => r.method === "chat.completions")!;
   assert.equal(chat.params.model, "anthropic/claude-opus-4.7-1m", "model passed through");
   assert.equal(chat.params.workspace, "/abs/path/to/proj", "workspace passed through");
-  assert.equal(chat.params.headless, true);
+  assert.deepEqual(chat.params.modes, ["headless"]);
 
   client.close();
   gw.close();

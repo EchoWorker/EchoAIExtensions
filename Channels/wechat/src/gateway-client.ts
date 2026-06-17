@@ -147,12 +147,14 @@ export class GatewayClient {
     this.activeTurns.add(sessionKey);
     this.segments.delete(sessionKey);
     try {
-      // headless=true: this channel has no UI to answer tool-approval / plan-
-      // review prompts, so let EchoCode auto-approve them (synthetic_auto_answer).
+      // modes=['headless']: this channel has no UI to answer tool-approval /
+      // plan-review prompts, so let EchoCode auto-approve them via HeadlessMode
+      // (synthetic_auto_answer). EchoAI also force-adds headless when there's no
+      // question coordinator, but we set it explicitly for clarity.
       const params: Record<string, unknown> = {
         session_key: sessionKey,
         content,
-        headless: true,
+        modes: ["headless"],
       };
       if (this.submitOpts.model) params.model = this.submitOpts.model;
       if (this.submitOpts.workspace) params.workspace = this.submitOpts.workspace;
