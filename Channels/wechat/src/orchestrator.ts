@@ -21,6 +21,7 @@ import {
   sendMessage,
   notifyStart,
   notifyStop,
+  WeixinSendError,
 } from "./protocol/api/api.js";
 import type { WeixinMessage, MessageItem } from "./protocol/api/types.js";
 import { weixinMessageToMsgContext, isMediaItem, type WeixinMsgContext } from "./protocol/messaging/inbound.js";
@@ -34,6 +35,7 @@ import {
 import { resolveStateDir } from "./protocol/storage/state-dir.js";
 import { logger } from "./protocol/util/logger.js";
 import { GatewayClient, type GatewayReply } from "./gateway-client.js";
+import { OutboundQueue } from "./outbound-queue.js";
 
 export type OrchestratorOptions = {
   accountId: string;
@@ -71,6 +73,9 @@ export class Orchestrator {
   private readonly syncBufPath: string;
   private getUpdatesBuf: string;
 
+  /** Serializes + paces + retries every outbound send (rate-limit safe). */
+  private readonly outbound: OutboundQueue;
+
   /** Most recent peer who messaged us (to_user for replies). */
   private lastFromUser = "";
   /** WeChat user id → latest context_token (required by sendMessage). */
@@ -97,6 +102,16 @@ export class Orchestrator {
 
     this.syncBufPath = getSyncBufFilePath(this.accountId);
     this.getUpdatesBuf = loadGetUpdatesBuf(this.syncBufPath) ?? "";
+
+    // All outbound sends funnel through here: serialized, paced, and retried
+    // with backoff on rate-limit (ret=-2) instead of being dropped. WeChat caps
+    // a session at ~30 msgs/min; we pace at 2.2s (~27/min) to stay under it,
+    // with backoff as a safety net for bursts that still hit the limit.
+    this.outbound = new OutboundQueue({
+      minIntervalMs: 2_200,
+      isRetryable: (err) => err instanceof WeixinSendError && err.rateLimited,
+      onError: (msg) => logger.error(`orchestrator: ${msg}`),
+    });
   }
 
   async start(): Promise<void> {
@@ -112,6 +127,7 @@ export class Orchestrator {
 
   async stop(): Promise<void> {
     this.running = false;
+    this.outbound.stop();
     try {
       await notifyStop({ baseUrl: this.baseUrl, token: this.token });
     } catch {
@@ -207,7 +223,7 @@ export class Orchestrator {
       await this.gateway.submit(this.sessionKey, content, attachments.map((p) => ({ path: p })));
     } catch (e) {
       logger.error(`orchestrator: gateway.submit failed: ${String(e)}`);
-      await this.sendText(fromUser, "（暂时无法处理你的消息，请稍后再试）").catch(() => {});
+      this.enqueueText(fromUser, "（暂时无法处理你的消息，请稍后再试）");
     }
   }
 
@@ -264,63 +280,77 @@ export class Orchestrator {
     }
     // Terminal error notice for the turn — friendly text, raw cause already logged.
     if (reply.isError) {
-      await this.sendText(toUser, ERROR_NOTICE);
+      this.enqueueText(toUser, ERROR_NOTICE);
       return;
     }
     const media = reply.media ?? [];
     if (media.length > 0) {
-      // Send each file; attach the text as a caption on the first one.
-      for (let i = 0; i < media.length; i++) {
-        const caption = i === 0 ? reply.text : "";
-        await this.sendMedia(toUser, media[i], caption);
+      // Deliver text and media as independent queued sends. We deliberately do
+      // NOT pass the text as a media caption: sendWeixinMediaFile issues TWO
+      // CGI calls (caption text item, then media item), so retrying the media
+      // as one unit (on rate-limit) would re-send the caption — duplicating
+      // what is often the whole answer. Decoupling keeps each send atomic.
+      if (reply.text) this.enqueueText(toUser, reply.text);
+      for (const filePath of media) {
+        this.enqueueMedia(toUser, filePath);
       }
       return;
     }
     if (reply.text) {
-      await this.sendText(toUser, reply.text);
+      this.enqueueText(toUser, reply.text);
     }
   };
 
-  private async sendMedia(toUser: string, filePath: string, caption: string): Promise<void> {
-    const contextToken = this.userContextToken.get(toUser) ?? "";
-    try {
-      await sendWeixinMediaFile({
-        filePath,
-        to: toUser,
-        text: caption,
-        opts: { baseUrl: this.baseUrl, token: this.token, contextToken },
-        cdnBaseUrl: this.cdnBaseUrl,
-      });
-      logger.info(`orchestrator: sent media → ${toUser} file=${path.basename(filePath)}`);
-    } catch (e) {
-      logger.error(`orchestrator: sendMedia → ${toUser} failed: ${String(e)}`);
-      // Fall back to at least delivering the caption text.
-      if (caption) await this.sendText(toUser, caption).catch(() => {});
-    }
+  /** Queue a text send (serialized + paced + rate-limit-retried). */
+  private enqueueText(toUser: string, text: string): void {
+    this.outbound.enqueue(() => this.doSendText(toUser, text), `text→${toUser}`);
   }
 
-  private async sendText(toUser: string, text: string): Promise<void> {
+  /** Queue a media send (serialized + paced + rate-limit-retried). */
+  private enqueueMedia(toUser: string, filePath: string): void {
+    this.outbound.enqueue(() => this.doSendMedia(toUser, filePath), `media→${toUser}`);
+  }
+
+  /**
+   * Perform a media send. Throws on rate-limit so the queue backs off + retries;
+   * other failures are logged loudly and dropped (the queue treats them as
+   * non-retryable). Text is delivered as a separate queued send (see
+   * onGatewayReply), so there is no caption to fall back to here.
+   */
+  private async doSendMedia(toUser: string, filePath: string): Promise<void> {
     const contextToken = this.userContextToken.get(toUser) ?? "";
-    try {
-      await sendMessage({
-        baseUrl: this.baseUrl,
-        token: this.token,
-        body: {
-          msg: {
-            from_user_id: "",
-            to_user_id: toUser,
-            client_id: generateClientId(),
-            message_type: 2, // BOT
-            message_state: 2, // FINISH
-            context_token: contextToken,
-            item_list: [{ type: 1, text_item: { text } }],
-          },
+    await sendWeixinMediaFile({
+      filePath,
+      to: toUser,
+      text: "",
+      opts: { baseUrl: this.baseUrl, token: this.token, contextToken },
+      cdnBaseUrl: this.cdnBaseUrl,
+    });
+    logger.info(`orchestrator: sent media → ${toUser} file=${path.basename(filePath)}`);
+  }
+
+  /**
+   * Perform a text send. Throws on failure (incl. rate-limit) so the queue can
+   * retry; the queue logs loudly when it ultimately gives up — no silent drop.
+   */
+  private async doSendText(toUser: string, text: string): Promise<void> {
+    const contextToken = this.userContextToken.get(toUser) ?? "";
+    await sendMessage({
+      baseUrl: this.baseUrl,
+      token: this.token,
+      body: {
+        msg: {
+          from_user_id: "",
+          to_user_id: toUser,
+          client_id: generateClientId(),
+          message_type: 2, // BOT
+          message_state: 2, // FINISH
+          context_token: contextToken,
+          item_list: [{ type: 1, text_item: { text } }],
         },
-      });
-      logger.info(`orchestrator: sent reply → ${toUser} (${text.length} chars)`);
-    } catch (e) {
-      logger.error(`orchestrator: sendText → ${toUser} failed: ${String(e)}`);
-    }
+      },
+    });
+    logger.info(`orchestrator: sent reply → ${toUser} (${text.length} chars)`);
   }
 }
 

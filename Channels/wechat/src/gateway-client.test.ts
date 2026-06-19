@@ -265,9 +265,10 @@ test("GatewayClient.listModels: returns gateway-provided model.list result", asy
   gw.close();
 });
 
-test("GatewayClient: segments split by message_id are delivered separately", async () => {
-  // EchoAI opens a new Step::Text (new message_id) when prose resumes after a
-  // tool call. Each segment must become its own WeChat message.
+test("GatewayClient: small adjacent segments are coalesced into one message", async () => {
+  // EchoAI emits many small Step::Text segments (new message_id when prose
+  // resumes after a tool call). To avoid flooding WeChat's rate limit, small
+  // adjacent segments are merged into a single message (joined by a blank line).
   const gw = await startMockGateway({
     script: [
       { type: "token", event: "append", message_id: "m1", content: "First " },
@@ -290,11 +291,49 @@ test("GatewayClient: segments split by message_id are delivered separately", asy
   void client.start();
   await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
   await client.submit("peer-1", "hi");
+  await waitFor(() => replies.length >= 1, 3000);
+  // Give any (incorrect) extra replies a chance to arrive before asserting count.
+  await new Promise((r) => setTimeout(r, 300));
+
+  assert.equal(replies.length, 1, "small segments merged into one message");
+  assert.equal(
+    replies[0].text,
+    "First paragraph.\n\nSecond one.",
+    "merged with a blank-line boundary, no trim",
+  );
+
+  client.close();
+  gw.close();
+});
+
+test("GatewayClient: a segment over the merge limit is delivered on its own", async () => {
+  // Once the buffer reaches the soft limit (1200 chars), the next new
+  // message_id flushes it as its own message instead of merging further.
+  const big = "x".repeat(1300);
+  const gw = await startMockGateway({
+    script: [
+      { type: "token", event: "append", message_id: "m1", content: big },
+      { type: "token", event: "append", message_id: "m2", content: "tail" },
+      { type: "turn", event: "end", turn_id: "t1", status: "done" },
+    ],
+  });
+  const replies: GatewayReply[] = [];
+  const client = new GatewayClient({
+    url: gw.url,
+    token: "t",
+    pluginName: "channel.wechat.test",
+    onReply: (r) => {
+      replies.push(r);
+    },
+  });
+  void client.start();
+  await waitFor(() => gw.requests.some((r) => r.method === "plugin.connect"), 3000);
+  await client.submit("peer-1", "hi");
   await waitFor(() => replies.length >= 2, 3000);
 
-  assert.equal(replies.length, 2, "two segments → two messages");
-  assert.equal(replies[0].text, "First paragraph.", "first segment flushed at boundary, no trim");
-  assert.equal(replies[1].text, "Second one.", "second segment flushed at turn end");
+  assert.equal(replies.length, 2, "oversized segment split from the following one");
+  assert.equal(replies[0].text, big, "the large segment is flushed on its own");
+  assert.equal(replies[1].text, "tail", "the next segment becomes a fresh message");
 
   client.close();
   gw.close();

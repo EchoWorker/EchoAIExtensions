@@ -67,6 +67,17 @@ const RECONNECT_CAP_MS = 30_000;
  */
 const SUBMIT_CONNECT_WAIT_MS = 8_000;
 
+/**
+ * Soft cap (chars) for coalescing consecutive text segments into one WeChat
+ * message. EchoAI splits text into many small Step::Text segments (one per
+ * message_id, e.g. progress notes between tool calls); delivering each as its
+ * own WeChat message floods the per-session rate limit (~30/min) and loses
+ * messages. We instead merge adjacent segments until adding the next would
+ * exceed this cap, collapsing a ~23-segment turn into a handful of messages.
+ * A single segment larger than the cap is still delivered on its own.
+ */
+const SEGMENT_MERGE_SOFT_LIMIT = 1_200;
+
 export class GatewayClient {
   private ws: WebSocket | null = null;
   private nextId = 1;
@@ -313,19 +324,33 @@ export class GatewayClient {
     if (params.subagent_task_id) return;
 
     if (type === "token" && event === "append") {
-      // Mirror EchoAI steps.rs folding: tokens carry a message_id; the same id
-      // appends to the current segment, a new id starts a fresh one. A new id
-      // means EchoAI opened a new Step::Text (text resumed after a tool call),
-      // which is a natural paragraph boundary — flush the previous segment so
-      // it's delivered as its own WeChat message.
+      // EchoAI emits many small Step::Text segments (one per message_id, e.g.
+      // short progress notes between tool calls). Delivering each as its own
+      // WeChat message floods the rate limit. We coalesce: same message_id
+      // appends to the current buffer; a *new* message_id merges into the same
+      // buffer (joined by a blank line) as long as the buffer is still under
+      // SEGMENT_MERGE_SOFT_LIMIT. Once the buffer reaches the cap, the next new
+      // message_id flushes it (one WeChat message) and starts a fresh buffer.
+      // Net effect: a ~23-segment turn collapses to a handful of messages,
+      // while a single oversized segment still goes out on its own.
       const msgId = (params.message_id as string | undefined) ?? "";
       const delta = (params.content as string | undefined) ?? "";
       const seg = this.segments.get(sessionKey);
-      if (seg && seg.msgId === msgId) {
-        seg.text += delta;
-      } else {
-        if (seg) this.flushSegment(sessionKey); // boundary → deliver previous
+      if (!seg) {
         this.segments.set(sessionKey, { msgId, text: delta });
+      } else if (seg.msgId === msgId) {
+        seg.text += delta;
+      } else if (seg.text.length + delta.length > SEGMENT_MERGE_SOFT_LIMIT) {
+        // Merging the new segment would exceed the soft cap → deliver the
+        // current buffer as its own message and start a fresh one. (A single
+        // segment that is itself larger than the cap still goes out whole,
+        // preserving code blocks / tables.)
+        this.flushSegment(sessionKey);
+        this.segments.set(sessionKey, { msgId, text: delta });
+      } else {
+        // Small enough to merge into the current buffer (paragraph boundary).
+        seg.msgId = msgId;
+        seg.text += (seg.text ? "\n\n" : "") + delta;
       }
     } else if (type === "error" && event === "raise") {
       // Record the cause; the friendly notice is emitted at turn/end. Flush any

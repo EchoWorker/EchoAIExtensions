@@ -224,7 +224,12 @@ export interface SendMessageReq {
 }
 
 export interface SendMessageResp {
-  // empty
+  /** Result code. 0 = success; non-zero = failure. -2 = rate limited. */
+  ret?: number;
+  /** Optional finer-grained error code. */
+  errcode?: number;
+  /** Human-readable error message (e.g. "rate limited"). */
+  errmsg?: string;
 }
 
 /** Typing status: 1 = typing (default), 2 = cancel typing. */

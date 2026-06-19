@@ -16,6 +16,7 @@ import type {
   NotifyStopResp,
   NotifyStartResp,
   SendMessageReq,
+  SendMessageResp,
   SendTypingReq,
   GetConfigResp,
 } from "./types.js";
@@ -465,11 +466,44 @@ export async function getUploadUrl(
   return resp;
 }
 
-/** Send a single message downstream. */
+/**
+ * Error thrown when WeChat's `sendmessage` CGI returns a non-zero `ret`.
+ *
+ * WeChat signals rate limiting with **HTTP 200 + body `{ret:-2, errmsg:"rate
+ * limited"}`** — i.e. not an HTTP error. Without inspecting `ret` the failure
+ * is invisible and the message is silently dropped. This typed error surfaces
+ * it so the caller can back off / retry instead of logging a phantom success.
+ */
+export class WeixinSendError extends Error {
+  readonly ret: number;
+  readonly errcode?: number;
+  readonly errmsg?: string;
+  /** True when the failure is a rate-limit (ret=-2 or errmsg mentions "rate limited"). */
+  readonly rateLimited: boolean;
+
+  constructor(params: { ret: number; errcode?: number; errmsg?: string }) {
+    const { ret, errcode, errmsg } = params;
+    super(`weixin sendmessage failed: ret=${ret} errcode=${errcode ?? "none"} errmsg=${errmsg ?? ""}`);
+    this.name = "WeixinSendError";
+    this.ret = ret;
+    this.errcode = errcode;
+    this.errmsg = errmsg;
+    this.rateLimited = ret === -2 || /rate limited/i.test(errmsg ?? "");
+  }
+}
+
+/**
+ * Send a single message downstream.
+ *
+ * Parses the response body and throws {@link WeixinSendError} when `ret` is a
+ * non-zero number, so rate-limit responses (HTTP 200 + `ret:-2`) are no longer
+ * silently swallowed. An empty / non-JSON 200 body is still treated as success
+ * (the historical happy path), since the CGI returns `{}` on success.
+ */
 export async function sendMessage(
   params: WeixinApiOptions & { body: SendMessageReq },
 ): Promise<void> {
-  await apiPostFetch({
+  const rawText = await apiPostFetch({
     baseUrl: params.baseUrl,
     endpoint: "ilink/bot/sendmessage",
     body: JSON.stringify({ ...params.body, base_info: buildBaseInfo() }),
@@ -477,6 +511,18 @@ export async function sendMessage(
     timeoutMs: params.timeoutMs ?? DEFAULT_API_TIMEOUT_MS,
     label: "sendMessage",
   });
+
+  let resp: SendMessageResp | undefined;
+  try {
+    resp = rawText.trim() ? (JSON.parse(rawText) as SendMessageResp) : undefined;
+  } catch {
+    // Non-JSON 200 body — treat as success (defensive; CGI returns JSON `{}`).
+    return;
+  }
+
+  if (resp && typeof resp.ret === "number" && resp.ret !== 0) {
+    throw new WeixinSendError({ ret: resp.ret, errcode: resp.errcode, errmsg: resp.errmsg });
+  }
 }
 
 /** Fetch bot config (includes typing_ticket) for a given user. */
