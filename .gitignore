@@ -29,3 +29,6 @@ Thumbs.db
 .env
 .env.*
 *.local
+
+# Rust build output
+target/
