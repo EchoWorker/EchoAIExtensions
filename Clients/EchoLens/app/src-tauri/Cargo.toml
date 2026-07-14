@@ -1,0 +1,38 @@
+[package]
+name = "echolens"
+version = "0.1.0"
+description = "EchoLens — a Windows screen-perception AI assistant"
+authors = ["EchoWorker"]
+edition = "2021"
+license = "AGPL-3.0-or-later"
+
+[lib]
+name = "echolens_lib"
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-single-instance = "2"
+tauri-plugin-dialog = "2"
+window-vibrancy = "0.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+dirs = "5"
+
+# The perception core (M1). Path dep — EchoLens is self-contained, no workspace.
+echolens-perception = { path = "../../echolens-perception" }
+
+# `windows` 0.62 to match what `uiautomation` 0.25 (via echolens-perception)
+# pulls in transitively — keeps a single unified version. Used for the DWM
+# cloak (show/hide the overlay) and foreground-window lookup.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_System_Com",
+    "Win32_UI_WindowsAndMessaging",
+] }

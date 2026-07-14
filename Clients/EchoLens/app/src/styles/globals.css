@@ -1,0 +1,129 @@
+/* highlight.js theme (GitHub-dark-ish, trimmed) for code blocks in answers.
+   Must come before @tailwind / other rules (CSS @import ordering). */
+@import 'highlight.js/styles/github-dark.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  /* Transparent so the rounded frosted card shows the desktop behind it. */
+  background: transparent;
+  overflow: hidden;
+  font-family: 'Segoe UI', system-ui, sans-serif;
+  -webkit-user-select: none;
+  user-select: none;
+}
+
+/* The frosted overlay card. window-vibrancy provides the real acrylic blur;
+   this is the visible surface + rounded border on top of it. */
+.overlay-card {
+  background: rgba(18, 22, 28, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(24px);
+}
+
+/* Let the user select/copy answer text even though the chrome is no-select. */
+.selectable {
+  -webkit-user-select: text;
+  user-select: text;
+}
+
+/* Markdown answer styling (compact). */
+.answer-md {
+  line-height: 1.6;
+  font-size: 14px;
+  color: #e2e8f0;
+}
+.answer-md p {
+  margin: 0.4em 0;
+}
+.answer-md h1,
+.answer-md h2,
+.answer-md h3 {
+  margin: 0.6em 0 0.3em;
+  font-weight: 600;
+}
+.answer-md ul,
+.answer-md ol {
+  margin: 0.4em 0;
+  padding-left: 1.4em;
+}
+.answer-md li {
+  margin: 0.15em 0;
+}
+.answer-md code {
+  background: rgba(255, 255, 255, 0.08);
+  padding: 0.1em 0.35em;
+  border-radius: 4px;
+  font-family: 'Cascadia Code', Consolas, monospace;
+  font-size: 0.9em;
+}
+.answer-md pre {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 0.5em 0;
+}
+.answer-md pre code {
+  background: transparent;
+  padding: 0;
+}
+.answer-md a {
+  color: #22d3ee;
+  text-decoration: none;
+}
+.answer-md a:hover {
+  text-decoration: underline;
+}
+.answer-md table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+}
+.answer-md th,
+.answer-md td {
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  padding: 4px 8px;
+}
+
+/* Thin scrollbars inside the overlay. */
+*::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+*::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.16);
+  border-radius: 4px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Blinking caret shown while the answer streams. */
+@keyframes blink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0;
+  }
+}
+.streaming-caret::after {
+  content: '▍';
+  margin-left: 1px;
+  animation: blink 1s step-start infinite;
+  color: #22d3ee;
+}

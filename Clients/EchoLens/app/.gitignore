@@ -1,0 +1,13 @@
+# Frontend
+node_modules
+dist
+*.local
+
+# Rust / Tauri
+src-tauri/target
+
+# Build logs (transient)
+*-out.txt
+clippy*.txt
+tsc-out.txt
+pnpm-out.txt

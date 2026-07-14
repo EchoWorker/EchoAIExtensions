@@ -1,0 +1,19 @@
+[package]
+name = "echolens-perception"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "EchoLens screen-perception core — extracts a pruned UI Automation tree from the Windows desktop and serializes it for an LLM."
+authors = ["EchoWorker"]
+repository = "https://github.com/EchoWorker/EchoAIExtensions"
+
+[lib]
+name = "echolens_perception"
+path = "src/lib.rs"
+
+# The crate body (model + builder) is platform-independent and unit-testable on
+# any OS. Only the capture layer needs Windows UI Automation, so `uiautomation`
+# is gated to the windows target. This keeps `cargo test` (builder algorithms)
+# runnable cross-platform and the dependency surface minimal.
+[target.'cfg(windows)'.dependencies]
+uiautomation = "0.25"

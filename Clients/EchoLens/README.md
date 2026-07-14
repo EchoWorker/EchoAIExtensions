@@ -19,6 +19,7 @@
 ## 文档
 
 - [`docs/PRODUCT_DESIGN.md`](docs/PRODUCT_DESIGN.md) — 完整产品设计文档
+- [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) — 详细实现方案（perception crate API、复用清单、热键/托盘/overlay、里程碑）
 
 ## 可行性验证
 
@@ -32,6 +33,7 @@ UIA Rust spike 已跑通（见设计文档 §2）：
 | 里程碑 | 状态 |
 |--------|------|
 | M0 可行性验证 | ✅ 完成 |
+| 实现方案设计 | ✅ 完成（见 `docs/IMPLEMENTATION.md`） |
 | M1 perception crate | ⏳ 待开工 |
 | M2 App 外壳 | ⏳ |
 | M3 打通链路 | ⏳ |
