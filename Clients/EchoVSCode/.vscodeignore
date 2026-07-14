@@ -1,0 +1,10 @@
+src/
+webview/
+shared/
+node_modules/
+*.ts
+*.mjs
+tsconfig*.json
+vite.config.ts
+docs/
+.gitignore

@@ -1,0 +1,92 @@
+{
+  "name": "echo-vscode",
+  "displayName": "EchoAI",
+  "description": "EchoAI Coding Assistant for VS Code",
+  "version": "0.1.0",
+  "publisher": "echoworker",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["AI", "Chat"],
+  "activationEvents": ["onStartupFinished"],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "panel": [
+        {
+          "id": "echoai-panel",
+          "title": "EchoAI",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "echoai-panel": [
+        {
+          "type": "webview",
+          "id": "echoai.chatView",
+          "name": "Chat"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "echoai.openChat",
+        "title": "EchoAI: Open Chat"
+      },
+      {
+        "command": "echoai.newSession",
+        "title": "EchoAI: New Chat Session"
+      },
+      {
+        "command": "echoai.sendSelection",
+        "title": "EchoAI: Send Selection to Chat"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "echoai.sendSelection",
+          "when": "editorHasSelection"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "echoai.openChat",
+        "key": "ctrl+alt+l",
+        "mac": "cmd+alt+l"
+      }
+    ]
+  },
+  "scripts": {
+    "build": "npm run build:ext && npm run build:webview",
+    "build:ext": "node esbuild.mjs",
+    "build:webview": "vite build",
+    "watch:ext": "node esbuild.mjs --watch",
+    "watch:webview": "vite build --watch",
+    "package": "vsce package --no-dependencies --allow-missing-repository"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/react": "^18.2.48",
+    "@types/react-dom": "^18.2.18",
+    "@types/vscode": "^1.85.0",
+    "@types/ws": "^8.5.10",
+    "@vitejs/plugin-react": "^4.2.1",
+    "esbuild": "^0.20.0",
+    "typescript": "^5.3.3",
+    "vite": "^5.0.12",
+    "@vscode/vsce": "^3.0.0"
+  },
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-markdown": "^9.0.1",
+    "remark-gfm": "^4.0.0",
+    "rehype-highlight": "^7.0.0",
+    "zustand": "^4.5.0",
+    "ws": "^8.16.0"
+  }
+}
