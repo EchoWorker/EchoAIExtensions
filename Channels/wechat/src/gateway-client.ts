@@ -3,8 +3,11 @@
  *
  * Talks to the EchoAI gateway over JSON-RPC/WebSocket:
  *   - auth + plugin.connect{plugin_type:"channel"}
- *   - chat.completions to start a turn for an inbound message
- *   - chat.enqueue (with steer_id) to inject into an in-flight turn
+ *   - chat.completions to submit an inbound message. The server atomically
+ *     routes it: it starts a turn when the session is idle, or degrades the
+ *     message to a steering injection into the running turn (returning
+ *     `steered:true`) when a turn is already in flight. Being headless, the
+ *     channel ignores `steered` and never predicts turn state locally.
  *   - consumes the chat.event stream, accumulates assistant text per session,
  *     and emits a single reply when the turn ends
  *   - handles plugin.message (agent-initiated sends)
@@ -20,7 +23,6 @@
  */
 
 import { WebSocket } from "ws";
-import { randomUUID } from "node:crypto";
 
 import { logger } from "./protocol/util/logger.js";
 
@@ -90,8 +92,6 @@ export class GatewayClient {
    * WeChat as its own message.
    */
   private readonly segments = new Map<string, { msgId: string; text: string }>();
-  /** session_keys with a turn currently running. */
-  private readonly activeTurns = new Set<string>();
   private connected = false;
   private closing = false;
   private reconnectAttempts = 0;
@@ -109,11 +109,6 @@ export class GatewayClient {
     this.ws = null;
   }
 
-  /** Whether a turn is currently running for this session. */
-  isTurnActive(sessionKey: string): boolean {
-    return this.activeTurns.has(sessionKey);
-  }
-
   // ── inbound → agent ─────────────────────────────────────────────────────
 
   /** Optional per-call overrides on chat.completions. */
@@ -125,25 +120,13 @@ export class GatewayClient {
   } = {};
 
   /**
-   * Submit an inbound platform message. Starts a new turn, or steers the
-   * running one if a turn is already active for this session.
+   * Submit an inbound platform message. Always sends chat.completions; the
+   * server atomically decides whether to start a new turn or degrade this
+   * message into a steering injection on the running turn (it guarantees at
+   * most one turn per session). The channel keeps no local turn state, so
+   * there is no check-then-act race across a reconnect.
    */
   async submit(sessionKey: string, content: string, attachments?: OutboundAttachment[]): Promise<void> {
-    if (this.activeTurns.has(sessionKey)) {
-      // A turn is running → steer it (C2: steer_id required).
-      try {
-        await this.rpc("chat.enqueue", {
-          session_key: sessionKey,
-          message: content,
-          steer_id: randomUUID(),
-        });
-        return;
-      } catch (e) {
-        logger.warn(`gateway: chat.enqueue failed, falling back to new turn: ${String(e)}`);
-        // fall through to a fresh completion
-      }
-    }
-
     // The socket may be mid-reconnect (gateway restart, transient drop). Wait
     // briefly for it to come back before giving up — the error notice the
     // orchestrator shows is meant for genuine failures, not a 1s blip.
@@ -155,7 +138,6 @@ export class GatewayClient {
       }
     }
 
-    this.activeTurns.add(sessionKey);
     this.segments.delete(sessionKey);
     try {
       // modes=['headless']: this channel has no UI to answer tool-approval /
@@ -174,7 +156,6 @@ export class GatewayClient {
       }
       await this.rpc("chat.completions", params);
     } catch (e) {
-      this.activeTurns.delete(sessionKey);
       this.segments.delete(sessionKey);
       throw e;
     }
@@ -250,7 +231,6 @@ export class GatewayClient {
         this.pending.clear();
         // Drop in-flight turn accumulation (server will restart turns).
         this.segments.clear();
-        this.activeTurns.clear();
         logger.info("gateway: connection closed");
         resolve();
       });
@@ -372,7 +352,6 @@ export class GatewayClient {
         ).catch((e) => logger.error(`gateway: onReply (error notice) failed: ${String(e)}`));
       }
 
-      this.activeTurns.delete(sessionKey);
       this.segments.delete(sessionKey);
     }
   }
