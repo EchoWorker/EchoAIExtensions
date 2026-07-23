@@ -6,6 +6,7 @@ import {
   downloadPlainCdnBuffer,
 } from "../cdn/pic-decrypt.js";
 import { silkToWav } from "./silk-transcode.js";
+import { sniffImageMime } from "./image-sniff.js";
 import type { WeixinMessage } from "../api/types.js";
 import { MessageItemType } from "../api/types.js";
 
@@ -61,9 +62,9 @@ export async function downloadMediaFromItem(
             `${label} image-plain`,
             img.media.full_url,
           );
-      const saved = await saveMedia(buf, undefined, "inbound", WEIXIN_MEDIA_MAX_BYTES);
+      const saved = await saveMedia(buf, sniffImageMime(buf), "inbound", WEIXIN_MEDIA_MAX_BYTES);
       result.decryptedPicPath = saved.path;
-      logger.debug(`${label} image saved: ${saved.path}`);
+      logger.debug(`${label} image saved: ${saved.path} (sniffed ${sniffImageMime(buf) ?? "unknown"})`);
     } catch (err) {
       logger.error(`${label} image download/decrypt failed: ${String(err)}`);
       errLog(`weixin ${label} image download/decrypt failed: ${String(err)}`);

@@ -381,6 +381,8 @@ function extFor(contentType?: string, originalFilename?: string): string {
       return ".gif";
     case "image/webp":
       return ".webp";
+    case "image/bmp":
+      return ".bmp";
     case "video/mp4":
       return ".mp4";
     case "audio/wav":
